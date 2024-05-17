@@ -20,6 +20,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 import org.junit.jupiter.engine.Constants;
 import org.junit.platform.engine.DiscoverySelector;
 import org.junit.platform.engine.discovery.DiscoverySelectors;
@@ -29,6 +36,10 @@ import org.junit.platform.launcher.TagFilter;
 import org.junit.platform.launcher.core.LauncherConfig;
 import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
 import org.junit.platform.launcher.core.LauncherFactory;
+import org.junit.platform.reporting.legacy.xml.LegacyXmlReportGeneratingListener;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.xml.sax.SAXException;
 
 public class ActualRunner implements RunsTest {
 
@@ -36,27 +47,22 @@ public class ActualRunner implements RunsTest {
   public boolean run(String testClassName) {
     String out = System.getenv("XML_OUTPUT_FILE");
     Path xmlOut;
+    Path suitesDir;
     try {
       xmlOut = out != null ? Paths.get(out) : Files.createTempFile("test", ".xml");
-      Files.createDirectories(xmlOut.getParent());
+      suitesDir = Files.createDirectories(xmlOut.getParent().resolve("suites"));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
 
-    try (BazelJUnitOutputListener bazelJUnitXml = new BazelJUnitOutputListener(xmlOut)) {
-      Runtime.getRuntime()
-          .addShutdownHook(
-              new Thread(
-                  () -> {
-                    bazelJUnitXml.closeForInterrupt();
-                  }));
-
+    try (PrintWriter writer = new PrintWriter(System.out)) {
       CommandLineSummary summary = new CommandLineSummary();
       FailFastExtension failFastExtension = new FailFastExtension();
 
       LauncherConfig config =
           LauncherConfig.builder()
-              .addTestExecutionListeners(bazelJUnitXml, summary, failFastExtension)
+              .addTestExecutionListeners(
+                  new LegacyXmlReportGeneratingListener(suitesDir, writer), summary, failFastExtension)
               .addPostDiscoveryFilters(TestSharding.makeShardFilter())
               .build();
 
@@ -119,14 +125,29 @@ public class ActualRunner implements RunsTest {
 
       Launcher launcher = LauncherFactory.create(config);
       launcher.execute(request.build());
+      writeAggregatedReport(suitesDir.toFile(), xmlOut.toFile());
 
       deleteExitFile(exitFile);
 
-      try (PrintWriter writer = new PrintWriter(System.out)) {
-        summary.writeTo(writer);
-      }
-
+      summary.writeTo(writer);
       return summary.getFailureCount() == 0;
+    }
+  }
+
+  private static void writeAggregatedReport(File suitesDir, File xmlOut) {
+    try {
+      DocumentBuilder documentBuilder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+      Document document = documentBuilder.newDocument();
+      Element suites = document.createElement("testsuites");
+      for (File suite : suitesDir.listFiles()) {
+        suites.appendChild(document.adoptNode(documentBuilder.parse(suite).getDocumentElement()));
+      }
+      document.appendChild(suites);
+      TransformerFactory.newInstance().newTransformer().transform(new DOMSource(document), new StreamResult(xmlOut));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } catch (ParserConfigurationException | SAXException | TransformerException e) {
+      throw new RuntimeException(e);
     }
   }
 
